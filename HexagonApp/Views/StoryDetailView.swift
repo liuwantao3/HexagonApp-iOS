@@ -15,6 +15,9 @@ struct StoryDetailView: View {
     @State private var timer: Timer?
     @State private var showDebug = false
     @State private var playbackSpeed: Double = 1.0
+    @State private var showAudioControls = false
+    @State private var fontSize: CGFloat = 17
+    @State private var imageTintColor: Color = Color.gray.opacity(0.1)
     
     private let apiService = APIService()
     
@@ -28,13 +31,52 @@ struct StoryDetailView: View {
     }
     
     var body: some View {
-        VStack(spacing: 0) {
-            storyScrollView
-            if showDebug {
-                debugOverlay
-                    .padding(.horizontal)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                storyScrollView
+                if showDebug {
+                    debugOverlay
+                        .padding(.horizontal)
+                }
+                if showAudioControls {
+                    audioControlBar
+                }
+                
+                if !showAudioControls {
+                    Spacer()
+                }
             }
-            audioControlBar
+            
+            if !showAudioControls && (fullStory?.hasAudio == true || story.hasAudio) {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 16) {
+                        Spacer()
+                        
+                        Button(action: { toggleAudio() }) {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 48, height: 48)
+                                .background(Color.gray.opacity(0.7))
+                                .clipShape(Circle())
+                        }
+                        
+                        Button(action: { showAudioControls = true }) {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 48, height: 48)
+                                .background(Color.gray.opacity(0.7))
+                                .clipShape(Circle())
+                        }
+                    }
+                    .padding(.trailing, 20)
+                    .padding(.bottom, geometry.size.width > geometry.size.height ? 60 : 40)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                }
+                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: showAudioControls)
+            }
         }
         .navigationTitle(story.title)
         .navigationBarTitleDisplayMode(.inline)
@@ -45,9 +87,10 @@ struct StoryDetailView: View {
                 }
             }
         }
-        .task {
+        .task(id: story.id) {
             await loadFullStory()
             prepareSentences()
+            extractImageColors(from: fullStory?.fullImageUrl ?? story.fullImageUrl)
         }
         .onDisappear {
             stopAudio()
@@ -56,15 +99,151 @@ struct StoryDetailView: View {
     
     // MARK: - Story Scroll View
     private var storyScrollView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                storyImage
-                storyMetadata
-                storyContent
-                progressIndicator
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    storyImage
+                    storyMetadata
+                    storyContent(proxy: proxy)
+                    progressIndicator
+                }
+                .padding(.bottom, 120)
             }
-            .padding(.bottom, 120)
+            .coordinateSpace(name: "scrollSpace")
+            .onChange(of: currentSentenceIndex) { newIndex in
+                if isPlaying {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo(newIndex, anchor: .center)
+                    }
+                }
+            }
         }
+    }
+    
+    // MARK: - Story Content with Highlighting
+    private func storyContent(proxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(sentences.enumerated()), id: \.offset) { index, sentence in
+                sentenceRow(index: index, sentence: sentence, proxy: proxy)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 16)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(imageTintColor)
+                .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 2)
+        )
+        .padding(.horizontal, 8)
+    }
+    
+    private func extractImageColors(from url: URL?) {
+        guard let url = url else { return }
+        
+        Task {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                if let cgImageSource = CGImageSourceCreateWithData(data as CFData, nil),
+                   let cgImage = CGImageSourceCreateImageAtIndex(cgImageSource, 0, nil) {
+                    await MainActor.run {
+                        imageTintColor = extractDominantColor(from: cgImage)
+                    }
+                }
+            } catch {
+                print("Failed to load image for color extraction: \(error)")
+            }
+        }
+    }
+    
+    private func extractDominantColor(from cgImage: CGImage) -> Color {
+        let width = 10
+        let height = 10
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        var rawData = [UInt8](repeating: 0, count: width * height * 4)
+        
+        guard let context = CGContext(
+            data: &rawData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return Color.gray.opacity(0.05)
+        }
+        
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        var totalR: CGFloat = 0
+        var totalG: CGFloat = 0
+        var totalB: CGFloat = 0
+        var count: CGFloat = 0
+        
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                let r = CGFloat(rawData[offset]) / 255.0
+                let g = CGFloat(rawData[offset + 1]) / 255.0
+                let b = CGFloat(rawData[offset + 2]) / 255.0
+                
+                totalR += r
+                totalG += g
+                totalB += b
+                count += 1
+            }
+        }
+        
+        let avgR = totalR / count
+        let avgG = totalG / count
+        let avgB = totalB / count
+        
+        let lightness = (avgR + avgG + avgB) / 3
+        
+        let tintFactor: CGFloat = 0.10
+        var r: CGFloat, g: CGFloat, b: CGFloat
+        
+        if lightness < 0.3 {
+            r = 1.0 - tintFactor * 0.3
+            g = 1.0 - tintFactor * 0.5
+            b = 1.0 - tintFactor * 0.8
+        } else if lightness < 0.5 {
+            r = 1.0 - tintFactor * 0.5
+            g = 1.0 - tintFactor * 0.6
+            b = 1.0 - tintFactor * 0.8
+        } else if lightness < 0.7 {
+            r = 1.0 - tintFactor * 0.8
+            g = 1.0 - tintFactor * 0.9
+            b = 1.0 - tintFactor * 1.0
+        } else {
+            r = 1.0 - tintFactor * 0.9
+            g = 1.0 - tintFactor * 0.95
+            b = 1.0 - tintFactor * 1.0
+        }
+        
+        return Color(red: r, green: g, blue: b)
+    }
+    
+    private func sentenceRow(index: Int, sentence: String, proxy: ScrollViewProxy) -> some View {
+        let isHighlighted = index == currentSentenceIndex
+        
+        return Text(sentence)
+            .font(.system(size: fontSize))
+            .fontWeight(isHighlighted ? .semibold : .regular)
+            .foregroundColor(isHighlighted ? .white : .primary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(isHighlighted ? Color.blue : Color.clear)
+            .cornerRadius(6)
+            .padding(.vertical, 2)
+            .padding(.horizontal, 4)
+            .background(isHighlighted ? Color.blue.opacity(0.15) : Color.clear)
+            .cornerRadius(8)
+            .animation(.easeInOut(duration: 0.3), value: currentSentenceIndex)
+            .id(index)
+            .onTapGesture {
+                seekToSentence(index)
+            }
     }
     
     // MARK: - Story Image
@@ -136,7 +315,7 @@ struct StoryDetailView: View {
         let isHighlighted = index == currentSentenceIndex
         
         return Text(sentence)
-            .font(.body)
+            .font(.system(size: fontSize))
             .fontWeight(isHighlighted ? .semibold : .regular)
             .foregroundColor(isHighlighted ? .white : .primary)
             .padding(.horizontal, 8)
@@ -200,6 +379,20 @@ struct StoryDetailView: View {
         Group {
             if fullStory?.hasAudio == true || story.hasAudio {
                 VStack(spacing: 8) {
+                    HStack {
+                        Spacer()
+                        Button(action: { showAudioControls = false }) {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Color.accentColor.opacity(0.7))
+                                .clipShape(Circle())
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    
                     Divider()
                     
                     if isPlaying || displayTime > 0 {
@@ -225,13 +418,6 @@ struct StoryDetailView: View {
             HStack {
                 Spacer()
                 
-                Button(action: restartAudio) {
-                    Image(systemName: "backward.end.fill")
-                        .font(.system(size: 24))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.trailing, 20)
-                
                 Button(action: toggleAudio) {
                     HStack(spacing: 8) {
                         Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
@@ -252,7 +438,22 @@ struct StoryDetailView: View {
             .padding(.horizontal)
             
             speedSelector
+            fontSizeSlider
         }
+    }
+    
+    private var fontSizeSlider: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "textformat.size.smaller")
+                .foregroundColor(.secondary)
+            
+            Slider(value: $fontSize, in: 12...28, step: 1)
+                .accentColor(.accentColor)
+            
+            Image(systemName: "textformat.size.larger")
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal)
     }
     
     private var speedSelector: some View {
@@ -345,8 +546,11 @@ struct StoryDetailView: View {
             startTimer()
         } else {
             self.player = AVPlayer(url: audioUrl)
-            self.player?.rate = Float(playbackSpeed)
             self.player?.play()
+            let playerRate = Float(playbackSpeed)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.player?.rate = playerRate
+            }
             isPlaying = true
             startTimer()
             
@@ -373,6 +577,16 @@ struct StoryDetailView: View {
         if !isPlaying {
             playAudio()
         }
+    }
+    
+    private func seekToSentence(_ index: Int) {
+        let timestamps = fullStory?.sentenceTimestamps ?? story.sentenceTimestamps
+        guard let timestamps = timestamps, index < timestamps.count else { return }
+        
+        let time = timestamps[index].startTime
+        player?.seek(to: CMTime(seconds: time, preferredTimescale: 1000))
+        displayTime = time
+        currentSentenceIndex = index
     }
     
     private func stopAudio() {

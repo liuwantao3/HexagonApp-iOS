@@ -1,10 +1,13 @@
 import SwiftUI
 
 struct StoryListView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var stories: [Story] = []
     @State private var isLoading = false
+    @State private var isSyncing = false
     @State private var errorMessage: String?
     @State private var selectedStory: Story?
+    @State private var hasNewContent = false
     
     private let apiService = APIService()
     
@@ -21,7 +24,7 @@ struct StoryListView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Button("Retry") {
-                            Task { await loadStories() }
+                            Task { await syncStories() }
                         }
                     }
                 } else if stories.isEmpty {
@@ -34,28 +37,99 @@ struct StoryListView: View {
                         }
                     }
                     .refreshable {
-                        await loadStories()
+                        await syncStories()
                     }
                 }
             }
             .navigationTitle("Stories")
+            .overlay(alignment: .top) {
+                if hasNewContent && !isSyncing {
+                    newContentBanner
+                }
+            }
             .task {
-                await loadStories()
+                await initializeStories()
+            }
+            .onChange(of: scenePhase) { newPhase in
+                if newPhase == .active {
+                    Task { await checkForUpdatesQuietly() }
+                }
             }
         }
     }
     
-    private func loadStories() async {
-        isLoading = true
-        errorMessage = nil
-        
-        do {
-            stories = try await apiService.fetchStories()
-        } catch {
-            errorMessage = error.localizedDescription
+    private var newContentBanner: some View {
+        HStack {
+            Image(systemName: "sparkles")
+            Text("New stories available")
+                .font(.caption)
+            Spacer()
+            Button("Refresh") {
+                Task { await syncStories() }
+            }
+            .font(.caption.bold())
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange)
+    }
+    
+    private func initializeStories() async {
+        if let cachedStories = apiService.getCachedStories(), !cachedStories.isEmpty {
+            stories = cachedStories
         }
         
+        isLoading = stories.isEmpty
+        
+        await checkForUpdatesAndSync()
+        
         isLoading = false
+    }
+    
+    private func checkForUpdatesAndSync() async {
+        isSyncing = true
+        
+        do {
+            let syncResponse = try await apiService.checkForUpdates(lastSync: apiService.getLastSyncTime())
+            hasNewContent = syncResponse.hasUpdates
+            
+            if syncResponse.hasUpdates {
+                await syncStories()
+            }
+        } catch {
+            await syncStories()
+        }
+        
+        isSyncing = false
+    }
+    
+    private func checkForUpdatesQuietly() async {
+        guard !isSyncing else { return }
+        
+        do {
+            let syncResponse = try await apiService.checkForUpdates(lastSync: apiService.getLastSyncTime())
+            hasNewContent = syncResponse.hasUpdates
+            
+            if syncResponse.hasUpdates {
+                await syncStories()
+            }
+        } catch {
+            // Silent fail for background sync
+        }
+    }
+    
+    private func syncStories() async {
+        do {
+            let newStories = try await apiService.fetchStories()
+            stories = newStories
+            apiService.cacheStories(newStories)
+            hasNewContent = false
+        } catch {
+            if stories.isEmpty {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 
