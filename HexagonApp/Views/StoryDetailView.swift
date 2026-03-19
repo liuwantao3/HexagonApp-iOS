@@ -14,8 +14,11 @@ struct StoryDetailView: View {
     @State private var displayTime: TimeInterval = 0
     @State private var timer: Timer?
     @State private var showDebug = false
+    @State private var playbackSpeed: Double = 1.0
     
     private let apiService = APIService()
+    
+    private let playbackSpeedOptions: [Double] = [0.8, 1.0, 1.25, 1.5, 2.0]
     
     private let baseWordsPerMinute: Double = 100
     
@@ -218,34 +221,76 @@ struct StoryDetailView: View {
     }
     
     private var controlButtons: some View {
-        HStack {
-            Spacer()
-            
-            Button(action: restartAudio) {
-                Image(systemName: "backward.end.fill")
-                    .font(.system(size: 24))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.trailing, 20)
-            
-            Button(action: toggleAudio) {
-                HStack(spacing: 8) {
-                    Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 44))
-                        .foregroundColor(.accentColor)
-                    
-                    Text(isPlaying ? "Pause" : "Play Audio")
-                        .font(.headline)
-                        .foregroundColor(.accentColor)
+        VStack(spacing: 12) {
+            HStack {
+                Spacer()
+                
+                Button(action: restartAudio) {
+                    Image(systemName: "backward.end.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(.secondary)
                 }
-                .padding()
-                .background(Color.accentColor.opacity(0.1))
-                .cornerRadius(12)
+                .padding(.trailing, 20)
+                
+                Button(action: toggleAudio) {
+                    HStack(spacing: 8) {
+                        Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundColor(.accentColor)
+                        
+                        Text(isPlaying ? "Pause" : "Play Audio")
+                            .font(.headline)
+                            .foregroundColor(.accentColor)
+                    }
+                    .padding()
+                    .background(Color.accentColor.opacity(0.1))
+                    .cornerRadius(12)
+                }
+                
+                Spacer()
             }
+            .padding(.horizontal)
             
-            Spacer()
+            speedSelector
+        }
+    }
+    
+    private var speedSelector: some View {
+        HStack(spacing: 12) {
+            Text("Speed:")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            ForEach(playbackSpeedOptions, id: \.self) { speed in
+                Button(action: {
+                    playbackSpeed = speed
+                    if isPlaying {
+                        player?.rate = Float(speed)
+                    }
+                }) {
+                    Text(speedLabel(speed))
+                        .font(.caption)
+                        .fontWeight(playbackSpeed == speed ? .bold : .regular)
+                        .foregroundColor(playbackSpeed == speed ? .white : .primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(playbackSpeed == speed ? Color.accentColor : Color.gray.opacity(0.2))
+                        .cornerRadius(6)
+                }
+            }
         }
         .padding(.horizontal)
+        .padding(.bottom, 8)
+    }
+    
+    private func speedLabel(_ speed: Double) -> String {
+        if speed == 1.0 {
+            return "1x"
+        } else if speed == floor(speed) {
+            return "\(Int(speed))x"
+        } else {
+            return String(format: "%.2gx", speed)
+        }
     }
     
     // MARK: - Calculations
@@ -294,11 +339,13 @@ struct StoryDetailView: View {
         guard let audioUrl = fullStory?.fullAudioUrl ?? story.fullAudioUrl else { return }
         
         if let player = player {
+            player.rate = Float(playbackSpeed)
             player.play()
             isPlaying = true
             startTimer()
         } else {
             self.player = AVPlayer(url: audioUrl)
+            self.player?.rate = Float(playbackSpeed)
             self.player?.play()
             isPlaying = true
             startTimer()
@@ -308,7 +355,7 @@ struct StoryDetailView: View {
                 object: self.player?.currentItem,
                 queue: .main
             ) { _ in
-                stopAudio()
+                self.stopAudio()
             }
         }
     }
