@@ -583,17 +583,22 @@ struct StoryDetailView: View {
             let newPlayer = AVPlayer(url: audioUrl)
             self.player = newPlayer
             
-            if let duration = newPlayer.currentItem?.asset.duration.seconds, duration.isFinite && duration > 0 {
-                audioDuration = duration
-            } else {
-                newPlayer.currentItem?.asset.loadValuesAsynchronously(forKeys: ["duration"]) {
-                    DispatchQueue.main.async {
-                        if let duration = newPlayer.currentItem?.duration.seconds, duration.isFinite && duration > 0 {
-                            self.audioDuration = duration
+            let loadTask = Task {
+                do {
+                    let item = newPlayer.currentItem
+                    guard item != nil else { return }
+                    let durationValue = try await item!.asset.load(AVAsyncProperty<AVAsset, CMTime>.duration)
+                    let seconds = CMTimeGetSeconds(durationValue)
+                    if seconds.isFinite && seconds > 0 {
+                        await MainActor.run {
+                            self.audioDuration = seconds
                         }
                     }
+                } catch {
+                    print("Failed to load duration: \(error)")
                 }
             }
+            _ = loadTask
             
             newPlayer.play()
             let playerRate = Float(playbackSpeed)
