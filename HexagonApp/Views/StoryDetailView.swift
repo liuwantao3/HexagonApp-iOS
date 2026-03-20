@@ -12,6 +12,9 @@ struct StoryDetailView: View {
     @State private var currentSentenceIndex = 0
     @State private var sentences: [String] = []
     @State private var displayTime: TimeInterval = 0
+    @State private var hasUserStartedPlayback = false
+    @State private var audioDuration: TimeInterval = 0
+    @State private var timeObserverToken: Any?
     @State private var timer: Timer?
     @State private var showDebug = false
     @State private var playbackSpeed: Double = 1.0
@@ -28,6 +31,19 @@ struct StoryDetailView: View {
     private var effectiveWordsPerMinute: Double {
         let speedFactor = fullStory?.voiceSpeed ?? story.voiceSpeed ?? 1.0
         return baseWordsPerMinute * speedFactor
+    }
+    
+    private var hasTimestamps: Bool {
+        let timestamps = fullStory?.sentenceTimestamps ?? story.sentenceTimestamps
+        return timestamps != nil && !timestamps!.isEmpty
+    }
+    
+    private var shouldHighlight: Bool {
+        hasUserStartedPlayback && hasTimestamps
+    }
+    
+    private var currentPlaybackTime: TimeInterval {
+        displayTime
     }
     
     var body: some View {
@@ -111,7 +127,7 @@ struct StoryDetailView: View {
             }
             .coordinateSpace(name: "scrollSpace")
             .onChange(of: currentSentenceIndex) { newIndex in
-                if isPlaying {
+                if shouldHighlight {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         proxy.scrollTo(newIndex, anchor: .center)
                     }
@@ -225,7 +241,7 @@ struct StoryDetailView: View {
     }
     
     private func sentenceRow(index: Int, sentence: String, proxy: ScrollViewProxy) -> some View {
-        let isHighlighted = index == currentSentenceIndex
+        let isHighlighted = shouldHighlight && index == currentSentenceIndex
         
         return Text(sentence)
             .font(.system(size: fontSize))
@@ -312,7 +328,7 @@ struct StoryDetailView: View {
     }
     
     private func sentenceRow(index: Int, sentence: String) -> some View {
-        let isHighlighted = index == currentSentenceIndex
+        let isHighlighted = shouldHighlight && index == currentSentenceIndex
         
         return Text(sentence)
             .font(.system(size: fontSize))
@@ -338,7 +354,7 @@ struct StoryDetailView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
-                    Text(formatTime(displayTime))
+                    Text(formatTime(currentPlaybackTime))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -352,7 +368,7 @@ struct StoryDetailView: View {
             Text("DEBUG")
                 .font(.caption.bold())
                 .foregroundColor(.red)
-            Text("Time: \(String(format: "%.2f", displayTime))s")
+            Text("Time: \(String(format: "%.2f", currentPlaybackTime))s")
             Text("Current Index: \(currentSentenceIndex)")
             Text("Using Timestamps: \((fullStory?.sentenceTimestamps ?? story.sentenceTimestamps) != nil ? "YES" : "NO")")
             if let timestamps = fullStory?.sentenceTimestamps ?? story.sentenceTimestamps {
@@ -408,7 +424,7 @@ struct StoryDetailView: View {
     }
     
     private var progressBar: some View {
-        ProgressView(value: displayTime, total: totalDuration)
+        ProgressView(value: currentPlaybackTime, total: totalDuration)
             .progressViewStyle(LinearProgressViewStyle())
             .padding(.horizontal)
     }
@@ -496,6 +512,9 @@ struct StoryDetailView: View {
     
     // MARK: - Calculations
     private var totalDuration: TimeInterval {
+        if audioDuration > 0 {
+            return audioDuration
+        }
         let content = fullStory?.content ?? story.content ?? ""
         let wordCount = content.split(separator: " ").count
         return TimeInterval(wordCount) / effectiveWordsPerMinute * 60
@@ -508,12 +527,27 @@ struct StoryDetailView: View {
             sentences = timestamps.map { $0.text }
         } else {
             let content = fullStory?.content ?? story.content ?? ""
-            let sentenceEndings = CharacterSet(charactersIn: ".!?\n")
-            let parts = content.components(separatedBy: sentenceEndings)
             
-            sentences = parts
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+            var result: [String] = []
+            let sentenceEndings = CharacterSet(charactersIn: ".!?")
+            
+            var currentSentence = ""
+            for char in content {
+                currentSentence.append(char)
+                if sentenceEndings.contains(char.unicodeScalars.first!) {
+                    let trimmed = currentSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        result.append(trimmed)
+                    }
+                    currentSentence = ""
+                }
+            }
+            
+            if !currentSentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                result.append(currentSentence.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            
+            sentences = result
         }
     }
     
@@ -543,15 +577,31 @@ struct StoryDetailView: View {
             player.rate = Float(playbackSpeed)
             player.play()
             isPlaying = true
+            hasUserStartedPlayback = true
             startTimer()
         } else {
-            self.player = AVPlayer(url: audioUrl)
-            self.player?.play()
+            let newPlayer = AVPlayer(url: audioUrl)
+            self.player = newPlayer
+            
+            if let duration = newPlayer.currentItem?.asset.duration.seconds, duration.isFinite && duration > 0 {
+                audioDuration = duration
+            } else {
+                newPlayer.currentItem?.asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+                    DispatchQueue.main.async {
+                        if let duration = newPlayer.currentItem?.duration.seconds, duration.isFinite && duration > 0 {
+                            self.audioDuration = duration
+                        }
+                    }
+                }
+            }
+            
+            newPlayer.play()
             let playerRate = Float(playbackSpeed)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.player?.rate = playerRate
+                newPlayer.rate = playerRate
             }
             isPlaying = true
+            hasUserStartedPlayback = true
             startTimer()
             
             NotificationCenter.default.addObserver(
@@ -593,35 +643,41 @@ struct StoryDetailView: View {
         player?.pause()
         player = nil
         isPlaying = false
+        hasUserStartedPlayback = false
         stopTimer()
     }
     
     private func startTimer() {
         stopTimer()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            updateCurrentSentence()
+        
+        guard let player = player else { return }
+        
+        let interval = CMTime(seconds: 0.05, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [self] time in
+            self.displayTime = time.seconds
+            self.updateCurrentSentence()
         }
     }
     
     private func stopTimer() {
+        if let token = timeObserverToken, let player = player {
+            player.removeTimeObserver(token)
+        }
+        timeObserverToken = nil
         timer?.invalidate()
         timer = nil
     }
     
     private func updateCurrentSentence() {
-        guard let player = player else { return }
+        guard let player = player, hasTimestamps else { return }
         
         displayTime = player.currentTime().seconds
         
         let timestamps = fullStory?.sentenceTimestamps ?? story.sentenceTimestamps
         
-        let newIndex: Int
-        if let timestamps = timestamps, !timestamps.isEmpty {
-            newIndex = timestamps.lastIndex { $0.startTime <= displayTime } ?? 0
-        } else {
-            let timePerSentence = totalDuration / Double(max(sentences.count, 1))
-            newIndex = min(Int(displayTime / timePerSentence), sentences.count - 1)
-        }
+        guard let timestamps = timestamps, !timestamps.isEmpty else { return }
+        
+        let newIndex = timestamps.lastIndex { $0.startTime <= displayTime } ?? 0
         
         if newIndex != currentSentenceIndex && newIndex >= 0 {
             currentSentenceIndex = newIndex
